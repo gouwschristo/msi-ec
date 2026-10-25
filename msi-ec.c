@@ -219,11 +219,13 @@ static struct msi_ec_conf CONF_G1_1 __initdata = {
 		.max_state        = 3,
 	},
 	.cpu_curve = {
+		.idle_address = 0x72,
 		.temp_address = 0x6a,
 		.duty_address = 0x73,
 		.points       = MSI_EC_FAN_CURVE_POINTS,
 	},
 	.gpu_curve = {
+		.idle_address = 0x8a,
 		.temp_address = 0x82,
 		.duty_address = 0x8b,
 		.points       = MSI_EC_FAN_CURVE_POINTS,
@@ -2629,6 +2631,40 @@ unlock:
 	return result < 0 ? result : count;
 }
 
+static ssize_t
+fan_curve_idle_common_show(const struct msi_ec_fan_curve_conf *curve, char *buf)
+{
+	u8 rdata;
+	int result;
+
+	result = ec_read(curve->idle_address, &rdata);
+	if (result < 0)
+		return result;
+
+	return sysfs_emit(buf, "%u\n", rdata);
+}
+
+static ssize_t
+fan_curve_idle_common_store(const struct msi_ec_fan_curve_conf *curve,
+			    const char *buf, size_t count)
+{
+	unsigned int value;
+	int result;
+
+	result = kstrtouint(buf, 0, &value);
+	if (result < 0)
+		return result;
+
+	if (value > 100)
+		return -EINVAL;
+
+	result = ec_write(curve->idle_address, value);
+	if (result < 0)
+		return result;
+
+	return count;
+}
+
 /*
  * Vendor "Adv_Fan" activation: set bit 6 and clear bit 7 of the fan-mode byte.
  * On MS-17E7 this turns 0x0d (auto) or 0x8d (advanced) into 0x4d, the same
@@ -3058,6 +3094,20 @@ static ssize_t cpu_fan_rpm_show(struct device *device,
 	return fan_rpm_common_show(&conf.cpu_rpm, buf);
 }
 
+static ssize_t cpu_fan_curve_idle_show(struct device *device,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	return fan_curve_idle_common_show(&conf.cpu_curve, buf);
+}
+
+static ssize_t cpu_fan_curve_idle_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	return fan_curve_idle_common_store(&conf.cpu_curve, buf, count);
+}
+
 static struct device_attribute dev_attr_cpu_fan_curve = {
 	.attr = {
 		.name = "fan_curve",
@@ -3065,6 +3115,15 @@ static struct device_attribute dev_attr_cpu_fan_curve = {
 	},
 	.show = cpu_fan_curve_show,
 	.store = cpu_fan_curve_store,
+};
+
+static struct device_attribute dev_attr_cpu_fan_curve_idle = {
+	.attr = {
+		.name = "fan_curve_idle",
+		.mode = 0644,
+	},
+	.show = cpu_fan_curve_idle_show,
+	.store = cpu_fan_curve_idle_store,
 };
 
 static struct device_attribute dev_attr_cpu_fan_rpm = {
@@ -3079,6 +3138,7 @@ static struct attribute *msi_cpu_attrs[] = {
 	&dev_attr_cpu_realtime_temperature.attr,
 	&dev_attr_cpu_realtime_fan_speed.attr,
 	&dev_attr_cpu_fan_curve.attr,
+	&dev_attr_cpu_fan_curve_idle.attr,
 	&dev_attr_cpu_fan_rpm.attr,
 	NULL
 };
@@ -3152,6 +3212,20 @@ static ssize_t gpu_fan_rpm_show(struct device *device,
 	return fan_rpm_common_show(&conf.gpu_rpm, buf);
 }
 
+static ssize_t gpu_fan_curve_idle_show(struct device *device,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	return fan_curve_idle_common_show(&conf.gpu_curve, buf);
+}
+
+static ssize_t gpu_fan_curve_idle_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	return fan_curve_idle_common_store(&conf.gpu_curve, buf, count);
+}
+
 static struct device_attribute dev_attr_gpu_fan_curve = {
 	.attr = {
 		.name = "fan_curve",
@@ -3159,6 +3233,15 @@ static struct device_attribute dev_attr_gpu_fan_curve = {
 	},
 	.show = gpu_fan_curve_show,
 	.store = gpu_fan_curve_store,
+};
+
+static struct device_attribute dev_attr_gpu_fan_curve_idle = {
+	.attr = {
+		.name = "fan_curve_idle",
+		.mode = 0644,
+	},
+	.show = gpu_fan_curve_idle_show,
+	.store = gpu_fan_curve_idle_store,
 };
 
 static struct device_attribute dev_attr_gpu_fan_rpm = {
@@ -3173,6 +3256,7 @@ static struct attribute *msi_gpu_attrs[] = {
 	&dev_attr_gpu_realtime_temperature.attr,
 	&dev_attr_gpu_realtime_fan_speed.attr,
 	&dev_attr_gpu_fan_curve.attr,
+	&dev_attr_gpu_fan_curve_idle.attr,
 	&dev_attr_gpu_fan_rpm.attr,
 	NULL
 };
@@ -3397,6 +3481,16 @@ static umode_t msi_ec_is_visible(struct kobject *kobj,
 	    attr == &dev_attr_cpu_fan_curve.attr ||
 	    attr == &dev_attr_gpu_fan_curve.attr)
 		return (conf.features & MSI_EC_FEAT_FAN_CURVE) ? attr->mode : 0;
+
+	if (attr == &dev_attr_cpu_fan_curve_idle.attr)
+		return (conf.features & MSI_EC_FEAT_FAN_CURVE) &&
+		       conf.cpu_curve.idle_address != MSI_EC_ADDR_UNSUPP ?
+		       attr->mode : 0;
+
+	if (attr == &dev_attr_gpu_fan_curve_idle.attr)
+		return (conf.features & MSI_EC_FEAT_FAN_CURVE) &&
+		       conf.gpu_curve.idle_address != MSI_EC_ADDR_UNSUPP ?
+		       attr->mode : 0;
 
 	if (attr == &dev_attr_cpu_fan_rpm.attr ||
 	    attr == &dev_attr_gpu_fan_rpm.attr)
@@ -3650,7 +3744,7 @@ MODULE_AUTHOR("Jose Angel Pastrana <japp0005@red.ujaen.es>");
 MODULE_AUTHOR("Aakash Singh <mail@singhaakash.dev>");
 MODULE_AUTHOR("Nikita Kravets <teackot@gmail.com>");
 MODULE_DESCRIPTION("MSI Embedded Controller (ng fork with fan curves and extra EC features)");
-MODULE_VERSION("0.14.0-ng");
+MODULE_VERSION("0.14.1-ng");
 
 module_init(msi_ec_init);
 module_exit(msi_ec_exit);

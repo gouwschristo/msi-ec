@@ -111,6 +111,12 @@ Description:
 		fan curve. Format: "t0,t1,t2,t3,t4,t5:d0,d1,d2,d3,d4,d5".
 		Both lists must be non-decreasing and values must be 0-100.
 
+What:		/sys/devices/platform/<platform>/cpu/fan_curve_idle
+What:		/sys/devices/platform/<platform>/gpu/fan_curve_idle
+Description:
+		Read/write the duty used while the temperature is below the
+		first curve point. Valid values: 0-100.
+
 What:		/sys/devices/platform/<platform>/cpu/fan_rpm
 What:		/sys/devices/platform/<platform>/gpu/fan_rpm
 Description:

@@ -64,9 +64,13 @@ struct msi_ec_fan_mode_conf {
 	struct msi_ec_mode modes[8]; // fixed size for easier hard coding
 };
 
-/* Six temperature points followed by six duty points */
+/*
+ * Six temperature points followed by six duty points, plus an optional
+ * idle duty used below the first temperature point.
+ */
 #define MSI_EC_FAN_CURVE_POINTS 6
 struct msi_ec_fan_curve_conf {
+	int idle_address;
 	int temp_address;
 	int duty_address;
 	int points;
