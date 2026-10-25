@@ -35,6 +35,7 @@ Description:
 			* "comfort"
 			* "sport"
 			* "turbo"
+			* "user"
 
 What:		/sys/devices/platform/<platform>/shift_mode
 Description:
@@ -70,6 +71,51 @@ Description:
 What:		/sys/devices/platform/<platform>/fw_release_date
 Description:
 		Read-only, returns the release date of the EC firmware.
+
+What:		/sys/devices/platform/<platform>/fan_curve_active
+Description:
+		Activates or deactivates the user fan curve using the vendor
+		"Adv_Fan" handshake (set bit 6, clear bit 7 of the fan-mode
+		byte). Write the curve itself through cpu/fan_curve and
+		gpu/fan_curve first.
+		Valid values: "on", "off".
+
+What:		/sys/devices/platform/<platform>/usb_power_share
+Description:
+		USB power sharing mode. Valid values: "off", "state0",
+		"state1", "state2", "state3", "state4", "state5".
+
+What:		/sys/devices/platform/<platform>/qc3
+Description:
+		Quick Charge 3.0 enable for the S0 (awake) state.
+		Valid values: "on", "off".
+
+What:		/sys/devices/platform/<platform>/panel
+Description:
+		Panel overdrive ("OD") toggle.
+		Valid values: "on", "off".
+
+What:		/sys/devices/platform/<platform>/kbd_backlight_enable
+Description:
+		Turns the keyboard backlight on or off without changing the
+		brightness level. Valid values: "on", "off".
+
+What:		/sys/devices/platform/<platform>/kbd_backlight_mode
+Description:
+		Keyboard backlight mode: 0 = always on, 1 = auto turn off.
+
+What:		/sys/devices/platform/<platform>/cpu/fan_curve
+What:		/sys/devices/platform/<platform>/gpu/fan_curve
+Description:
+		Read/write the six temperature and six duty points of the
+		fan curve. Format: "t0,t1,t2,t3,t4,t5:d0,d1,d2,d3,d4,d5".
+		Both lists must be non-decreasing and values must be 0-100.
+
+What:		/sys/devices/platform/<platform>/cpu/fan_rpm
+What:		/sys/devices/platform/<platform>/gpu/fan_rpm
+Description:
+		Read-only, fan speed in RPM, computed from the 16-bit EC
+		tachometer value as 480000 / tach.
 
 What:		/sys/devices/platform/<platform>/debug/ec_dump
 Description:

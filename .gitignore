@@ -1,9 +1,12 @@
 *.o
 *.o.d
 *.cmd
-/msi-ec.ko
-/msi-ec.mod
-/msi-ec.mod.c
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
 /Module.symvers
 /modules.order
 .vscode

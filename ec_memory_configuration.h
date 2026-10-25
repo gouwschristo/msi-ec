@@ -3,10 +3,19 @@
 
 #include <linux/types.h>
 
-#define MSI_EC_DRIVER_NAME "msi-ec"
+#define MSI_EC_DRIVER_NAME "msi-ec-ng"
 
 #define MSI_EC_ADDR_UNKNOWN 0xff01 // unknown address
 #define MSI_EC_ADDR_UNSUPP  0xff01 // unsupported parameter
+
+/* Optional feature bits, set per configuration (CONF_*) */
+#define MSI_EC_FEAT_FAN_CURVE  (1U << 0)
+#define MSI_EC_FEAT_FAN_RPM    (1U << 1)
+#define MSI_EC_FEAT_USB_SHARE  (1U << 2)
+#define MSI_EC_FEAT_QC         (1U << 3)
+#define MSI_EC_FEAT_PANEL      (1U << 4)
+
+#define MSI_EC_FAN_TACH_CONST  480000 /* 60e6 / (2 * 62.5) */
 
 // Firmware info addresses are universal
 #define MSI_EC_FW_VERSION_ADDRESS 0xa0
@@ -42,7 +51,7 @@ struct msi_ec_mode {
 #define MSI_EC_SHIFT_MODE_NAME_LIMIT 20
 struct msi_ec_shift_mode_conf {
 	int address;
-	struct msi_ec_mode modes[5]; // fixed size for easier hard coding
+	struct msi_ec_mode modes[8]; // fixed size for easier hard coding
 };
 
 struct msi_ec_super_battery_conf {
@@ -52,7 +61,34 @@ struct msi_ec_super_battery_conf {
 
 struct msi_ec_fan_mode_conf {
 	int address;
-	struct msi_ec_mode modes[5]; // fixed size for easier hard coding
+	struct msi_ec_mode modes[8]; // fixed size for easier hard coding
+};
+
+/* Six temperature points followed by six duty points */
+#define MSI_EC_FAN_CURVE_POINTS 6
+struct msi_ec_fan_curve_conf {
+	int temp_address;
+	int duty_address;
+	int points;
+};
+
+/* 16-bit tachometer, low byte at tach_address, high byte at tach_address - 1 */
+struct msi_ec_fan_rpm_conf {
+	int tach_address;
+};
+
+struct msi_ec_usb_power_share_conf {
+	int address;
+};
+
+struct msi_ec_qc_conf {
+	int address;
+	int bit;
+};
+
+struct msi_ec_panel_conf {
+	int address;
+	int bit;
 };
 
 struct msi_ec_cpu_conf {
@@ -85,6 +121,8 @@ struct msi_ec_kbd_bl_conf {
 struct msi_ec_conf {
 	const char **allowed_fw;
 
+	unsigned int features;
+
 	int charge_control_address;
 	struct msi_ec_webcam_conf         webcam;
 	struct msi_ec_fn_win_swap_conf    fn_win_swap;
@@ -96,6 +134,14 @@ struct msi_ec_conf {
 	struct msi_ec_gpu_conf            gpu;
 	struct msi_ec_led_conf            leds;
 	struct msi_ec_kbd_bl_conf         kbd_bl;
+
+	struct msi_ec_fan_curve_conf      cpu_curve;
+	struct msi_ec_fan_curve_conf      gpu_curve;
+	struct msi_ec_fan_rpm_conf        cpu_rpm;
+	struct msi_ec_fan_rpm_conf        gpu_rpm;
+	struct msi_ec_usb_power_share_conf usb_power_share;
+	struct msi_ec_qc_conf             qc;
+	struct msi_ec_panel_conf          panel;
 };
 
 #endif // __MSI_EC_REGISTERS_CONFIG__

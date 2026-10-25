@@ -27,6 +27,7 @@
 
 #include <acpi/battery.h>
 #include <linux/acpi.h>
+#include <linux/bitops.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -43,11 +44,13 @@
 static DEFINE_MUTEX(ec_set_by_mask_mutex);
 static DEFINE_MUTEX(ec_unset_by_mask_mutex);
 static DEFINE_MUTEX(ec_set_bit_mutex);
+static DEFINE_MUTEX(ec_sequence_mutex);
 
 #define SM_ECO_NAME		"eco"
 #define SM_COMFORT_NAME		"comfort"
 #define SM_SPORT_NAME		"sport"
 #define SM_TURBO_NAME		"turbo"
+#define SM_USER_NAME		"user"
 
 #define FM_AUTO_NAME		"auto"
 #define FM_SILENT_NAME		"silent"
@@ -153,6 +156,8 @@ static const char *ALLOWED_FW_G1_1[] __initconst = {
 
 static struct msi_ec_conf CONF_G1_1 __initdata = {
 	.allowed_fw = ALLOWED_FW_G1_1, // legacy fw_1
+	.features = MSI_EC_FEAT_FAN_CURVE | MSI_EC_FEAT_FAN_RPM |
+		    MSI_EC_FEAT_USB_SHARE | MSI_EC_FEAT_QC | MSI_EC_FEAT_PANEL,
 	.charge_control_address = 0xef,
 	.webcam = {
 		.address       = 0x2e,
@@ -175,6 +180,7 @@ static struct msi_ec_conf CONF_G1_1 __initdata = {
 			{ SM_ECO_NAME,     0xc2 },
 			{ SM_COMFORT_NAME, 0xc1 },
 			{ SM_SPORT_NAME,   0xc0 },
+			{ SM_USER_NAME,    0xc3 },
 			MSI_EC_MODE_NULL
 		},
 	},
@@ -185,6 +191,7 @@ static struct msi_ec_conf CONF_G1_1 __initdata = {
 		.address = 0xf4,
 		.modes = {
 			{ FM_AUTO_NAME,     0x0d },
+			{ FM_SILENT_NAME,   0x1d },
 			{ FM_BASIC_NAME,    0x4d },
 			{ FM_ADVANCED_NAME, 0x8d },
 			MSI_EC_MODE_NULL
@@ -199,8 +206,8 @@ static struct msi_ec_conf CONF_G1_1 __initdata = {
 		.rt_fan_speed_address = 0x89,
 	},
 	.leds = {
-		.micmute_led_address = MSI_EC_ADDR_UNSUPP,
-		.mute_led_address    = MSI_EC_ADDR_UNSUPP,
+		.micmute_led_address = 0x2b,
+		.mute_led_address    = 0x2c,
 		.bit                 = 2,
 	},
 	.kbd_bl = {
@@ -210,6 +217,33 @@ static struct msi_ec_conf CONF_G1_1 __initdata = {
 		.bl_state_address = 0xf3,
 		.state_base_value = 0x80,
 		.max_state        = 3,
+	},
+	.cpu_curve = {
+		.temp_address = 0x6a,
+		.duty_address = 0x73,
+		.points       = MSI_EC_FAN_CURVE_POINTS,
+	},
+	.gpu_curve = {
+		.temp_address = 0x82,
+		.duty_address = 0x8b,
+		.points       = MSI_EC_FAN_CURVE_POINTS,
+	},
+	.cpu_rpm = {
+		.tach_address = 0xcd,
+	},
+	.gpu_rpm = {
+		.tach_address = 0xcb,
+	},
+	.usb_power_share = {
+		.address = 0xf7,
+	},
+	.qc = {
+		.address = 0x2f,
+		.bit     = 2,
+	},
+	.panel = {
+		.address = 0x2e,
+		.bit     = 4,
 	},
 };
 
@@ -2479,6 +2513,393 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
 	return -EINVAL;
 }
 
+/* ============================================================ */
+/* Fan curves, fan RPM, USB power-share, QC3 and panel/OD       */
+/* ============================================================ */
+
+static ssize_t fan_curve_common_show(const struct msi_ec_fan_curve_conf *curve,
+				     char *buf)
+{
+	u8 temps[MSI_EC_FAN_CURVE_POINTS];
+	u8 duty[MSI_EC_FAN_CURVE_POINTS];
+	int result;
+	int count = 0;
+
+	if (curve->points != MSI_EC_FAN_CURVE_POINTS)
+		return -EOPNOTSUPP;
+
+	result = ec_read_seq(curve->temp_address, temps, curve->points);
+	if (result < 0)
+		return result;
+
+	result = ec_read_seq(curve->duty_address, duty, curve->points);
+	if (result < 0)
+		return result;
+
+	for (int i = 0; i < curve->points; i++) {
+		result = sysfs_emit_at(buf, count, "%s%u", i ? "," : "", temps[i]);
+		if (result < 0)
+			return result;
+		count += result;
+	}
+
+	result = sysfs_emit_at(buf, count, ":");
+	if (result < 0)
+		return result;
+	count += result;
+
+	for (int i = 0; i < curve->points; i++) {
+		result = sysfs_emit_at(buf, count, "%s%u", i ? "," : "", duty[i]);
+		if (result < 0)
+			return result;
+		count += result;
+	}
+
+	result = sysfs_emit_at(buf, count, "\n");
+	if (result < 0)
+		return result;
+	count += result;
+
+	return count;
+}
+
+static ssize_t fan_curve_common_store(const struct msi_ec_fan_curve_conf *curve,
+				      const char *buf, size_t count)
+{
+	unsigned int temps[MSI_EC_FAN_CURVE_POINTS];
+	unsigned int duty[MSI_EC_FAN_CURVE_POINTS];
+	u8 old_temps[MSI_EC_FAN_CURVE_POINTS];
+	u8 old_duty[MSI_EC_FAN_CURVE_POINTS];
+	int result;
+	int i;
+
+	if (curve->points != MSI_EC_FAN_CURVE_POINTS)
+		return -EOPNOTSUPP;
+
+	result = sscanf(buf, "%u,%u,%u,%u,%u,%u:%u,%u,%u,%u,%u,%u",
+			&temps[0], &temps[1], &temps[2],
+			&temps[3], &temps[4], &temps[5],
+			&duty[0], &duty[1], &duty[2],
+			&duty[3], &duty[4], &duty[5]);
+	if (result != 2 * MSI_EC_FAN_CURVE_POINTS)
+		return -EINVAL;
+
+	for (i = 0; i < curve->points; i++) {
+		if (temps[i] > 100 || duty[i] > 100)
+			return -EINVAL;
+		if (i && (temps[i] < temps[i - 1] || duty[i] < duty[i - 1]))
+			return -EINVAL;
+	}
+
+	mutex_lock(&ec_sequence_mutex);
+
+	/* keep the old curve so a failed write can be rolled back */
+	result = ec_read_seq(curve->temp_address, old_temps, curve->points);
+	if (result < 0)
+		goto unlock;
+
+	result = ec_read_seq(curve->duty_address, old_duty, curve->points);
+	if (result < 0)
+		goto unlock;
+
+	for (i = 0; i < curve->points; i++) {
+		result = ec_write(curve->temp_address + i, temps[i]);
+		if (result < 0)
+			goto rollback;
+	}
+
+	for (i = 0; i < curve->points; i++) {
+		result = ec_write(curve->duty_address + i, duty[i]);
+		if (result < 0)
+			goto rollback;
+	}
+
+	result = 0;
+	goto unlock;
+
+rollback:
+	for (i = 0; i < curve->points; i++)
+		ec_write(curve->temp_address + i, old_temps[i]);
+	for (i = 0; i < curve->points; i++)
+		ec_write(curve->duty_address + i, old_duty[i]);
+
+unlock:
+	mutex_unlock(&ec_sequence_mutex);
+
+	return result < 0 ? result : count;
+}
+
+/*
+ * Vendor "Adv_Fan" activation: set bit 6 and clear bit 7 of the fan-mode byte.
+ * On MS-17E7 this turns 0x0d (auto) or 0x8d (advanced) into 0x4d, the same
+ * value the vendor handshake produces.
+ */
+static ssize_t fan_curve_active_show(struct device *device,
+				     struct device_attribute *attr,
+				     char *buf)
+{
+	u8 rdata;
+	int result;
+
+	result = ec_read(conf.fan_mode.address, &rdata);
+	if (result < 0)
+		return result;
+
+	return sysfs_emit(buf, "%s\n", str_on_off(rdata & BIT(6)));
+}
+
+static ssize_t fan_curve_active_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	bool value;
+	u8 rdata;
+	int result;
+
+	result = kstrtobool(buf, &value);
+	if (result)
+		return result;
+
+	mutex_lock(&ec_sequence_mutex);
+
+	result = ec_read(conf.fan_mode.address, &rdata);
+	if (result < 0)
+		goto unlock;
+
+	if (value)
+		rdata = (rdata | BIT(6)) & ~BIT(7);
+	else
+		rdata &= ~BIT(6);
+
+	result = ec_write(conf.fan_mode.address, rdata);
+
+unlock:
+	mutex_unlock(&ec_sequence_mutex);
+
+	return result < 0 ? result : count;
+}
+
+static ssize_t fan_rpm_common_show(const struct msi_ec_fan_rpm_conf *rpm,
+				   char *buf)
+{
+	u8 low, high;
+	unsigned int tach;
+	int result;
+
+	result = ec_read(rpm->tach_address, &low);
+	if (result < 0)
+		return result;
+
+	result = ec_read(rpm->tach_address - 1, &high);
+	if (result < 0)
+		return result;
+
+	tach = ((unsigned int)high << 8) | low;
+
+	return sysfs_emit(buf, "%u\n", tach ? MSI_EC_FAN_TACH_CONST / tach : 0);
+}
+
+struct msi_ec_usb_share_state {
+	u8 value;
+	const char *name;
+};
+
+static const struct msi_ec_usb_share_state msi_usb_share_states[] = {
+	{ 0x80, "off" },
+	{ 0x81, "state0" },
+	{ 0x82, "state1" },
+	{ 0x83, "state2" },
+	{ 0xc1, "state3" },
+	{ 0xc2, "state4" },
+	{ 0xc3, "state5" },
+};
+
+static ssize_t usb_power_share_show(struct device *device,
+				    struct device_attribute *attr,
+				    char *buf)
+{
+	u8 rdata;
+	int result;
+
+	result = ec_read(conf.usb_power_share.address, &rdata);
+	if (result < 0)
+		return result;
+
+	for (int i = 0; i < ARRAY_SIZE(msi_usb_share_states); i++) {
+		if (rdata == msi_usb_share_states[i].value)
+			return sysfs_emit(buf, "%s\n",
+					  msi_usb_share_states[i].name);
+	}
+
+	return sysfs_emit(buf, "unknown (0x%02x)\n", rdata);
+}
+
+static ssize_t usb_power_share_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int result;
+
+	for (int i = 0; i < ARRAY_SIZE(msi_usb_share_states); i++) {
+		if (sysfs_streq(msi_usb_share_states[i].name, buf)) {
+			result = ec_write(conf.usb_power_share.address,
+					  msi_usb_share_states[i].value);
+			if (result < 0)
+				return result;
+
+			return count;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static ssize_t qc3_show(struct device *device, struct device_attribute *attr,
+			char *buf)
+{
+	int result;
+	bool value;
+
+	result = ec_check_bit(conf.qc.address, conf.qc.bit, &value);
+	if (result < 0)
+		return result;
+
+	return sysfs_emit(buf, "%s\n", str_on_off(value));
+}
+
+static ssize_t qc3_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	int result;
+	bool value;
+
+	result = kstrtobool(buf, &value);
+	if (result)
+		return result;
+
+	result = ec_set_bit(conf.qc.address, conf.qc.bit, value);
+	if (result < 0)
+		return result;
+
+	return count;
+}
+
+static ssize_t panel_show(struct device *device, struct device_attribute *attr,
+			  char *buf)
+{
+	int result;
+	bool value;
+
+	result = ec_check_bit(conf.panel.address, conf.panel.bit, &value);
+	if (result < 0)
+		return result;
+
+	return sysfs_emit(buf, "%s\n", str_on_off(value));
+}
+
+static ssize_t panel_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	int result;
+	bool value;
+
+	result = kstrtobool(buf, &value);
+	if (result)
+		return result;
+
+	result = ec_set_bit(conf.panel.address, conf.panel.bit, value);
+	if (result < 0)
+		return result;
+
+	return count;
+}
+
+static ssize_t kbd_backlight_enable_show(struct device *device,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	u8 rdata;
+	u8 mask = conf.kbd_bl.state_base_value;
+	int result;
+
+	result = ec_read(conf.kbd_bl.bl_state_address, &rdata);
+	if (result < 0)
+		return result;
+
+	return sysfs_emit(buf, "%s\n",
+			  str_on_off(mask ? (rdata & mask) == mask : rdata != 0));
+}
+
+static ssize_t kbd_backlight_enable_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	u8 mask = conf.kbd_bl.state_base_value;
+	int result;
+	bool value;
+
+	result = kstrtobool(buf, &value);
+	if (result)
+		return result;
+
+	if (!mask)
+		return -EOPNOTSUPP;
+
+	if (value)
+		result = ec_set_by_mask(conf.kbd_bl.bl_state_address, mask);
+	else
+		result = ec_unset_by_mask(conf.kbd_bl.bl_state_address, mask);
+
+	if (result < 0)
+		return result;
+
+	return count;
+}
+
+static ssize_t kbd_backlight_mode_show(struct device *device,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	u8 rdata;
+	u8 mask = conf.kbd_bl.bl_modes[0] | conf.kbd_bl.bl_modes[1];
+	int result;
+
+	result = ec_read(conf.kbd_bl.bl_mode_address, &rdata);
+	if (result < 0)
+		return result;
+
+	if (!mask)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%u\n",
+			  (rdata & mask) == conf.kbd_bl.bl_modes[1] ? 1 : 0);
+}
+
+static ssize_t kbd_backlight_mode_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	u8 mask = conf.kbd_bl.bl_modes[0] | conf.kbd_bl.bl_modes[1];
+	unsigned int mode;
+	int result;
+
+	result = kstrtouint(buf, 0, &mode);
+	if (result < 0)
+		return result;
+
+	if (mode > conf.kbd_bl.max_mode)
+		return -EINVAL;
+
+	if (!mask)
+		return -EOPNOTSUPP;
+
+	result = ec_set_bit(conf.kbd_bl.bl_mode_address, __ffs(mask), mode != 0);
+	if (result < 0)
+		return result;
+
+	return count;
+}
+
 static ssize_t fw_version_show(struct device *device,
 			       struct device_attribute *attr, char *buf)
 {
@@ -2539,6 +2960,12 @@ static DEVICE_ATTR_RO(available_fan_modes);
 static DEVICE_ATTR_RW(fan_mode);
 static DEVICE_ATTR_RO(fw_version);
 static DEVICE_ATTR_RO(fw_release_date);
+static DEVICE_ATTR_RW(fan_curve_active);
+static DEVICE_ATTR_RW(usb_power_share);
+static DEVICE_ATTR_RW(qc3);
+static DEVICE_ATTR_RW(panel);
+static DEVICE_ATTR_RW(kbd_backlight_enable);
+static DEVICE_ATTR_RW(kbd_backlight_mode);
 
 static struct attribute *msi_root_attrs[] = {
 	&dev_attr_webcam.attr,
@@ -2553,6 +2980,12 @@ static struct attribute *msi_root_attrs[] = {
 	&dev_attr_fan_mode.attr,
 	&dev_attr_fw_version.attr,
 	&dev_attr_fw_release_date.attr,
+	&dev_attr_fan_curve_active.attr,
+	&dev_attr_usb_power_share.attr,
+	&dev_attr_qc3.attr,
+	&dev_attr_panel.attr,
+	&dev_attr_kbd_backlight_enable.attr,
+	&dev_attr_kbd_backlight_mode.attr,
 	NULL
 };
 
@@ -2604,9 +3037,49 @@ static struct device_attribute dev_attr_cpu_realtime_fan_speed = {
 	.show = cpu_realtime_fan_speed_show,
 };
 
+static ssize_t cpu_fan_curve_show(struct device *device,
+				  struct device_attribute *attr,
+				  char *buf)
+{
+	return fan_curve_common_show(&conf.cpu_curve, buf);
+}
+
+static ssize_t cpu_fan_curve_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	return fan_curve_common_store(&conf.cpu_curve, buf, count);
+}
+
+static ssize_t cpu_fan_rpm_show(struct device *device,
+				struct device_attribute *attr,
+				char *buf)
+{
+	return fan_rpm_common_show(&conf.cpu_rpm, buf);
+}
+
+static struct device_attribute dev_attr_cpu_fan_curve = {
+	.attr = {
+		.name = "fan_curve",
+		.mode = 0644,
+	},
+	.show = cpu_fan_curve_show,
+	.store = cpu_fan_curve_store,
+};
+
+static struct device_attribute dev_attr_cpu_fan_rpm = {
+	.attr = {
+		.name = "fan_rpm",
+		.mode = 0444,
+	},
+	.show = cpu_fan_rpm_show,
+};
+
 static struct attribute *msi_cpu_attrs[] = {
 	&dev_attr_cpu_realtime_temperature.attr,
 	&dev_attr_cpu_realtime_fan_speed.attr,
+	&dev_attr_cpu_fan_curve.attr,
+	&dev_attr_cpu_fan_rpm.attr,
 	NULL
 };
 
@@ -2658,9 +3131,49 @@ static struct device_attribute dev_attr_gpu_realtime_fan_speed = {
 	.show = gpu_realtime_fan_speed_show,
 };
 
+static ssize_t gpu_fan_curve_show(struct device *device,
+				  struct device_attribute *attr,
+				  char *buf)
+{
+	return fan_curve_common_show(&conf.gpu_curve, buf);
+}
+
+static ssize_t gpu_fan_curve_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	return fan_curve_common_store(&conf.gpu_curve, buf, count);
+}
+
+static ssize_t gpu_fan_rpm_show(struct device *device,
+				struct device_attribute *attr,
+				char *buf)
+{
+	return fan_rpm_common_show(&conf.gpu_rpm, buf);
+}
+
+static struct device_attribute dev_attr_gpu_fan_curve = {
+	.attr = {
+		.name = "fan_curve",
+		.mode = 0644,
+	},
+	.show = gpu_fan_curve_show,
+	.store = gpu_fan_curve_store,
+};
+
+static struct device_attribute dev_attr_gpu_fan_rpm = {
+	.attr = {
+		.name = "fan_rpm",
+		.mode = 0444,
+	},
+	.show = gpu_fan_rpm_show,
+};
+
 static struct attribute *msi_gpu_attrs[] = {
 	&dev_attr_gpu_realtime_temperature.attr,
 	&dev_attr_gpu_realtime_fan_speed.attr,
+	&dev_attr_gpu_fan_curve.attr,
+	&dev_attr_gpu_fan_rpm.attr,
 	NULL
 };
 
@@ -2878,6 +3391,33 @@ static umode_t msi_ec_is_visible(struct kobject *kobj,
 
 	if (!conf_loaded)
 		return 0;
+
+	/* feature-gated attributes */
+	if (attr == &dev_attr_fan_curve_active.attr ||
+	    attr == &dev_attr_cpu_fan_curve.attr ||
+	    attr == &dev_attr_gpu_fan_curve.attr)
+		return (conf.features & MSI_EC_FEAT_FAN_CURVE) ? attr->mode : 0;
+
+	if (attr == &dev_attr_cpu_fan_rpm.attr ||
+	    attr == &dev_attr_gpu_fan_rpm.attr)
+		return (conf.features & MSI_EC_FEAT_FAN_RPM) ? attr->mode : 0;
+
+	if (attr == &dev_attr_usb_power_share.attr)
+		return (conf.features & MSI_EC_FEAT_USB_SHARE) ? attr->mode : 0;
+
+	if (attr == &dev_attr_qc3.attr)
+		return (conf.features & MSI_EC_FEAT_QC) ? attr->mode : 0;
+
+	if (attr == &dev_attr_panel.attr)
+		return (conf.features & MSI_EC_FEAT_PANEL) ? attr->mode : 0;
+
+	if (attr == &dev_attr_kbd_backlight_enable.attr)
+		return (conf.kbd_bl.bl_state_address != MSI_EC_ADDR_UNSUPP &&
+			conf.kbd_bl.state_base_value) ? attr->mode : 0;
+
+	if (attr == &dev_attr_kbd_backlight_mode.attr)
+		return (conf.kbd_bl.bl_mode_address != MSI_EC_ADDR_UNSUPP &&
+			conf.kbd_bl.max_mode > 0) ? attr->mode : 0;
 
 	/* root group */
 	if (attr == &dev_attr_webcam.attr)
@@ -3109,8 +3649,8 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jose Angel Pastrana <japp0005@red.ujaen.es>");
 MODULE_AUTHOR("Aakash Singh <mail@singhaakash.dev>");
 MODULE_AUTHOR("Nikita Kravets <teackot@gmail.com>");
-MODULE_DESCRIPTION("MSI Embedded Controller");
-MODULE_VERSION("0.13");
+MODULE_DESCRIPTION("MSI Embedded Controller (ng fork with fan curves and extra EC features)");
+MODULE_VERSION("0.14.0-ng");
 
 module_init(msi_ec_init);
 module_exit(msi_ec_exit);
